@@ -1,0 +1,155 @@
+# 3D time independent Hydrogen atom
+
+#Sec 0: Importing packages
+
+import numpy as np
+import numba
+from numba import jit # "pip install numba "
+import scipy
+from scipy.sparse.linalg import eigs
+from scipy.sparse.linalg import eigsh
+from scipy import sparse
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+mpl.rcParams.update(mpl.rcParamsDefault)
+import scienceplots # "pip install scienceplots"
+plt.style.use(['science','ieee', "no-latex"])
+#For GPU optimisation of code
+from skimage import measure
+import torch 
+import plotly.graph_objects as go
+from torch import lobpcg
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+import plotly.io as pio
+import plotly.express as px
+pio.renderers.default = "svg"
+
+#Sec 1: 3D cube domain
+
+L = 5
+n_max = 50
+print("n^3 = "+str(n_max**3) )
+dx = L/(n_max-1)
+
+x_vals = np.linspace(-L/2, L/2, n_max)
+y_vals = x_vals
+z_vals = x_vals
+
+alpha = - 1/(2*dx**2)
+
+#1.1: Antiproton values
+
+t_max = 10
+
+#Sec 2: Generating the Hamiltonian
+
+@numba.jit( "(( float64[:,:,: ] ))( float64[:,:,:] ) ", nopython = True, nogil = True)
+def get_potential(total_V):
+    for index_x, x in enumerate(x_vals):
+        for index_y, y in enumerate(y_vals):
+            for index_z, z in enumerate(z_vals):
+                eps = 1e-10 #Prevents infinities
+                r = np.sqrt( x**2 + y**2 + z**2 )
+                V_nuc = -1/( r + eps)
+                total_V[index_x, index_y, index_z] = V_nuc
+    return total_V
+
+ #Diagonal V
+matrix_V = np.zeros( (n_max, n_max, n_max ) )
+matrix_V = get_potential( matrix_V.astype(float) )
+flat_V = matrix_V.flatten()
+V = sparse.spdiags( flat_V, np.array( [0] ), n_max**3, n_max**3 )
+
+
+diag = np.ones ( [n_max] )
+diags = np.array( [ diag, -2*diag, diag ] )
+
+D = sparse.spdiags( diags, np.array( [-1,0,1] ), n_max, n_max )
+
+T = ( -1/(2*dx**2) )*sparse.kronsum( D,  sparse.kronsum(D,D) )
+
+
+#Sec 3.0: Important functions
+
+@numba.jit( "(( c16[:,:,:] ))( c16[:,:,:] )", nopython = True, nogil = True)
+def normalise( wavefunc_3D ):
+    '''
+    Normalises the 3D wavefunction.
+    '''  
+    norm = np.sum( np.abs( wavefunc_3D )**2   )*dx**3 
+    print(norm)
+    return wavefunc_3D/np.sqrt(norm)
+
+def get_eigs(H, n, k):
+    '''
+    Takes the Hamiltonian as an input, and returns n many lowest eigenvalues and a k-th eigenstate.
+    Normalises the eigenstate.
+    Returns:
+        eigenenergies, eigenvalues
+    '''
+    eig_vals, eig_vecs = eigsh( H, k = n, which = "SA")
+    psi = np.reshape( eig_vecs[ :, k], (n_max, n_max, n_max) )
+    psi = normalise(psi.astype(complex))
+    return eig_vals, psi
+
+
+#Sec 3: Finding the eigenvalues and eigenvectors of H
+
+H = T + V
+
+# Converting H to a PyTorch tensor
+'''
+H = H.tocoo()
+H = torch.sparse_coo_tensor(indices = torch.tensor( [H.row, H.col] ), values = torch.tensor( H.data ), size=H.shape).to(device)
+
+eig_vals, eig_vecs = lobpcg( H, k = 20, largest=False   )
+
+print(eig_vals)
+
+def get_e(n):
+    return eig_vecs.T[n].reshape( (n_max,n_max,n_max) ).cpu().numpy()
+
+
+verts, faces, _, _ = measure.marching_cubes( get_e(16)**2, 1e-6, spacing = (0.1,0.1,0.1))
+intensity = np.linalg.norm( verts, axis = 1)
+fig = go.Figure(data=[go.Mesh3d(x=verts[:, 0], y=verts[:,1], z=verts[:,2], i = faces[:, 0], j = faces[:,1], k =faces[:,2], intensity = intensity, colorscale = "Agsunset", opacity = 0.5)])
+fig.update_layout(scene=dict(xaxis = dict(visible = False), yaxis = dict(visible=False), zaxis=dict(visible=False) ), margin=dict(l=0,r=0,b=0,t=0 ) )
+fig.show()                                
+'''                          
+                               
+n = 50 #Number of eigenvalues
+k = 19 #Which eigenstate is considered, 0<=k<=n-1
+
+eig_vals, psi = get_eigs(H, n, k)
+
+print(eig_vals)
+                           
+#Sec 4: Generating some plots
+
+#4.1: 3D probability density graphs
+
+mask_val = 0.001
+
+def plot4d(data):
+    fig = plt.figure(figsize=(5, 5))
+    ax = fig.add_subplot(projection="3d")
+    ax.xaxis.pane.fill = False
+    ax.yaxis.pane.fill = False
+    ax.zaxis.pane.fill = False
+    mask = data > mask_val
+    #idx = np.arange(int(np.prod(data.shape)))
+    x, y, z = np.meshgrid(x_vals, y_vals, z_vals) #np.unravel_index(idx, data.shape)
+    ax.scatter(x, y, z, c=data.flatten(), s=10.0 * mask, edgecolor="face", alpha=0.2, marker="o", cmap="hot", linewidth=0)
+    plt.tight_layout()
+    plt.savefig("test_scatter_4d.png", dpi=250)
+    plt.title(r"$ \vert \psi \vert^2 > "+str(mask_val)+", n=$" +str( k )+r", $E_h =$"+str( np.round(eig_vals[ k ], 4 ) ) )
+    plt.show()
+
+plot4d( np.abs( psi )**2 )
+
+#4.2 Eigenvalue spectrum
+
+plt.plot(eig_vals, "x")
+plt.ylabel("Energy, "+ r"$E_h$")
+plt.title("Eigenvalue spectrum for hydrogen in a box of length "+str(L))
+plt.show()
