@@ -1,0 +1,335 @@
+import numpy as np
+from numpy import asarray
+from numpy import savetxt
+
+import math
+
+from scipy.linalg import eigh
+
+import matplotlib.pyplot as plt
+
+import numba
+from numba import jit
+
+def gaussians( ng, zeta_0, beta, r_vals ):
+    gaussian_basis = np.zeros( ( ng, len(r_vals) ) )
+    zetas = np.zeros( ng )
+    for index in range(ng):
+        zeta = zeta_0*beta**index
+        gaussian_basis[index,:] = r_vals*np.exp( -zeta*r_vals**2 )
+        zetas[index] = zeta
+    return gaussian_basis, zetas
+
+def get_potential(r_vals, pseudo_status, A, k):
+    eps = 1e-10
+    if pseudo_status == True:
+        potential = -(2/(r_vals+eps)) + A *np.exp(-2*k*r_vals)/(r_vals+eps)
+    else:
+        potential = -1/(r_vals+eps)
+    return potential
+
+
+
+def get_eigs(gaussian_basis, zetas, r_vals, pseudo_status, A, k):
+
+    potential = get_potential(r_vals, pseudo_status, A, k)
+    dr = r_vals[1] - r_vals[0]
+    ng = len(zetas)
+    H = np.zeros( ( ng, ng ) )
+    Q = np.zeros( ( ng, ng ) )
+    for i in range(ng):
+        for j in range(ng):
+            zeta_i, zeta_j = zetas[i], zetas[j]
+            mu = zeta_i + zeta_j
+            gaussian_i = gaussian_basis[i,:]
+            gaussian_j = gaussian_basis[j,:]
+
+            Q_ij = 0.25*np.sqrt( np.pi/mu**3  )
+            Q[i, j] = Q_ij
+            
+            T_ij = 3*Q_ij*(zeta_i*zeta_j/mu)
+            V_ij = np.sum( gaussian_i * gaussian_j * potential ) *dr
+            H[i, j] = T_ij + V_ij
+            
+    energies, coeffs = eigh(H,Q)
+    
+    wavefunctions = np.zeros( ( ng, len(r_vals) ) )
+    for i in range(ng):
+        wavefunction = 0
+        for j in range(ng):
+            wavefunction += coeffs[j, i]*gaussian_basis[j,:]
+        if max(abs(wavefunction)) != max(wavefunction): wavefunction = - wavefunction
+        wavefunctions[i,:] = wavefunction                     
+        
+    return energies, wavefunctions, potential
+
+#--- Getting a Gaussian basis
+
+ng = 10
+zeta_0 = 0.001
+beta = 2.5
+
+r_vals = np.linspace(0,50,200)
+
+dr = r_vals[1] - r_vals[0]
+print(dr)
+
+gaussian_basis, zetas = gaussians( ng, zeta_0, beta, r_vals )
+
+plt.plot(r_vals, np.transpose(gaussian_basis) )
+plt.show()
+
+
+#--- Hellmsnn pseudopotential parameters
+A = 3
+k = 0.6666
+energies, wavefunctions, potential = get_eigs(gaussian_basis, zetas, r_vals, True, A, k)
+
+plt.plot(r_vals, potential)
+plt.title(r"$A=$"+str(A)+r", $\kappa=$"+str(k))
+plt.ylim(-2,2)
+plt.xlabel("Radial distance, "+r"$a_0$")
+plt.ylabel("Potential energy")
+plt.show()
+
+print(energies)
+
+bound_counter = 0
+for energy in energies:
+    if energy < 0: bound_counter += 1
+print("There are "+str(bound_counter)+" bound states.")
+
+n_max = bound_counter + 1
+n_vals = np.linspace(2,n_max+1,n_max)
+
+plt.plot([2,3], [-0.669, -0.267], "s", color="red", label="Direct analysis")
+plt.plot(n_vals, energies[0:n_max], "x", color="blue")
+#plt.plot(n_vals, -1/(2*n_vals**2), "--", color="black")
+plt.ylim(-1,1)
+plt.ylabel("Energy, " +r"$E_h$")
+plt.xlabel("Principle quantum number "+r"$n$")
+plt.show()
+
+@jit()
+def ap_potential(timestep, wavefunctions, r_vals, t_vals, b, v, t_off):
+    
+    ng = len(wavefunctions)
+    V_ap = np.zeros( ( ng, ng ) )
+    dt = t_vals[1] - t_vals[0]
+    dr = r_vals[1] - r_vals[0]
+    for i in range(ng):
+        for j in range(ng):
+            potential = 1/np.sqrt( (r_vals-b)**2 + v**2*dt**2*(timestep-t_off)**2 )
+            wavefunc_i = wavefunctions[i,:]
+            wavefunc_j = wavefunctions[j,:]
+            V_ap[i,j] = np.sum( wavefunc_i*wavefunc_j*potential )*dr
+    
+    return V_ap
+
+
+def run_CEM_sim( init_coeffs, wavefunctions, energies, r_vals, t_vals, ap_vals, ap_status ):
+    ng = len(energies)
+    nt = len(t_vals)
+    dt = t_vals[1] - t_vals[0]
+    dr = r_vals[1] - r_vals[0]
+    b,v,t_off = ap_vals[0], ap_vals[1], ap_vals[2]
+    
+    n_bound = 0
+    for energy in energies:
+        if energy < 0: n_bound += 1
+    
+    normal_vals = np.zeros( nt )
+    normal_vals[0] = 1
+
+    surv_probs = np.zeros( nt )
+    surv_probs[0] = 1
+    
+    ex_probs = np.zeros( nt )
+    ex_probs[0] = 0
+
+    ion_probs = np.zeros( nt )
+    ion_probs[0] = 0
+    
+    all_coeffs = np.zeros( ( ng, nt ), dtype=complex )
+    all_coeffs[:,0] = init_coeffs
+    eye = np.diag( np.ones( ng ) )
+    E_diag = np.diag( energies )
+    
+    for t in range(1, nt):
+        #if t%10000 == 0: print(t)
+        
+        V_ap = 0
+        if ap_status == True: V_ap = ap_potential(t, wavefunctions, r_vals, t_vals, b, v, t_off)
+        
+        all_coeffs[:,t] = (eye - 1j*dt*E_diag - 1j*dt*V_ap)@all_coeffs[:,t-1]
+        normal_vals[t] = np.sum(np.abs(all_coeffs[:,t])**2)
+        all_coeffs[:,t] = all_coeffs[:,t]/np.sqrt( normal_vals[t] )
+        
+        surv_probs[t] = np.abs( all_coeffs[0,t] )**2
+        ex_probs[t] = 1 - surv_probs[t]
+        ion_probs[t] = np.sum ( np.abs( all_coeffs[n_bound+1:-1,t] )**2 )
+        normal_vals[t] = np.sum( np.abs( all_coeffs[:,t])**2 )
+    
+    return all_coeffs, surv_probs, ex_probs, ion_probs, normal_vals
+
+#--- Plotting wavefunctions
+
+plt.plot(r_vals, wavefunctions[0,:], "-",  label=r"$2s: E_{2s} =$"+str(np.round(energies[0],5)))
+plt.plot(r_vals, wavefunctions[1,:], "-.", label=r"$3s: E_{3s} =$"+str(np.round(energies[1],5)))
+#plt.plot(r_vals, wavefunctions[2,:], "--", label=r"$3s: E_{4s} =$"+str(np.round(energies[2],5)))
+plt.plot(r_vals, potential, "k:", label="Pseudopotential")
+plt.xlabel("Radial distance "+r"$a_0$")
+plt.ylabel("Probability amplitude")
+plt.ylim(-1.5,1.5)
+plt.legend()
+plt.show()
+
+#--- Setting up coefficient evolution method
+
+init_coeffs = np.zeros( ng )
+init_coeffs[0] = 1
+
+nt = 30001
+dt = 3e-4
+total_time = nt*dt
+
+t_vals = np.linspace(0,nt*dt,nt)
+
+b, v, nt_off, status = 5, 5, nt/3, True
+ap_vals = [b,v,nt_off+1]
+
+#--- Running a simulation
+
+all_coeffs, surv_probs, ex_probs, ion_probs, normal_vals = run_CEM_sim( init_coeffs, wavefunctions, energies, r_vals, t_vals, ap_vals, status )
+
+#--- PLotting the values we get
+
+plt.plot(t_vals, np.abs(all_coeffs[0,:])**2, label=r"$b_1(t)$")
+plt.plot(t_vals, np.abs(all_coeffs[1,:])**2, label=r"$b_2(t)$")
+plt.plot(t_vals, np.abs(all_coeffs[2,:])**2, label=r"$b_3(t)$")
+plt.ylim(-0.1,1.1)
+plt.axvline(nt_off*dt, linestyle="dotted", color="black",label="Impact time")
+plt.xlabel("Time (a.u.)")
+plt.ylabel("Probability")
+plt.title("b="+str(b)+r"$a_0, v=$"+str(v)+r"$a.u. , t_{\text{off}}=$"+str(np.round(nt_off*dt,2))+r"$a.u.$")
+plt.legend()
+plt.show()
+
+plt.plot(t_vals, surv_probs, label=r"$w_{\text{surv}}$")
+plt.plot(t_vals, ex_probs, label=r"$w_{\text{ex}}$")
+plt.plot(t_vals, ion_probs, label=r"$w_{\text{ion}}$")
+plt.ylim(-0.1,1.1)
+plt.axvline(nt_off*dt, linestyle="dotted", color="black",label="Impact time")
+plt.xlabel("Time (a.u.)")
+plt.ylabel("Probability")
+plt.title("b="+str(b)+r"$a_0, v=$"+str(v)+r"$a.u. , t_{\text{off}}=$"+str(np.round(nt_off*dt,2))+r"$a.u.$")
+plt.legend()
+plt.show()
+
+plt.plot(t_vals, surv_probs, label=r"$w_{\text{surv}}$")
+plt.ylim(-0.1,1.1)
+plt.axvline(nt_off*dt, linestyle="dotted", color="black",label="Impact time")
+plt.xlabel("Time (a.u.)")
+plt.ylabel("Probability")
+plt.title("b="+str(b)+r"$a_0, v=$"+str(v)+r"$a.u. , t_{\text{off}}=$"+str(np.round(nt_off*dt,2))+r"$a.u.$")
+plt.legend()
+plt.show()
+
+plt.plot(t_vals, normal_vals)
+plt.title("Normal values")
+plt.ylim(-0.1,1.1)
+plt.xlabel("Time (a.u.)")
+plt.show()
+
+b_range = np.linspace(0.5,10.5,21)
+db = b_range[1] - b_range[0]
+v_range = np.linspace(0.5,10.5,21)
+
+cross_sections_ex = np.zeros(21)
+cross_sections_ion = np.zeros(21)
+
+end_ex_probs = np.zeros(21)
+end_ion_probs = np.zeros(21)
+
+all_ion_probs = np.zeros((21,21))
+all_ex_probs = np.zeros((21,21))
+
+nt_off, status = nt/3, True
+
+for index_v, v in enumerate(v_range):
+    for index_b, b in enumerate(b_range):
+        print("v="+str(v)+",b="+str(b))
+        
+        ap_vals = [b,v,nt_off+1]
+        all_coeffs, surv_probs, ex_probs, ion_probs, normal_vals = run_CEM_sim( init_coeffs, wavefunctions, energies, r_vals, t_vals, ap_vals, status )
+        
+        end_ex_probs[index_b] = ex_probs[-1]
+        all_ex_probs[index_b,index_v] = ex_probs[-1]
+        
+        end_ion_probs[index_b] = ion_probs[-1]
+        
+        all_ion_probs[index_b,index_v] = ion_probs[-1]
+    cross_sections_ex[index_v] = 2*np.pi*np.sum(b_range*end_ex_probs)*db
+    cross_sections_ion[index_v] = 2*np.pi*np.sum(b_range*end_ion_probs)*db
+    print("For v ="+str(v)+", cross section of excitation ="+str(cross_sections_ex[index_v])+",cross section of ionisation ="+str(cross_sections_ion[index_v]))
+
+plt.plot(v_range,cross_sections_ex,label=r"$\sigma_{\text{ex}}$")
+plt.plot(v_range,cross_sections_ion,label=r"$\sigma_{\text{ion}}$")
+plt.title("Cross section of interaction")
+plt.xlabel("Velocity (a.u.)")
+plt.ylabel("Cross section, "+r"$a_0^2$")
+plt.legend()
+plt.show()
+
+
+#Converting to other units
+
+E_range = (918/2)*(v_range)**2*27.2/1000
+
+Pandey_energies = [10.031956044365698,19.961625249677944,29.873888570960162,
+                   39.540414912083435, 49.82541628826433, 59.47915970142414,
+                   70.65267539604942,79.11710058773382, 89.46734230188392,
+                   99.19872403421381,199.4680687927284,298.5335405391241,
+                   395.1106236654619, 500.2933948930573]
+Pandey_cross_secs = [ 1.5518353500483775, 1.4098152107696167, 1.2898574960880107,
+                     1.1893581948708147, 1.0972024797830786, 1.0245887931961248,
+                     0.9603724452620136, 0.9128910496076061, 0.8710238063953555,
+                     0.8403370880466334, 0.5610748115675428, 0.4299126820120166,
+                     0.3406177956687405, 0.26527467539448313]
+
+plt.loglog(E_range,cross_sections_ex*(0.529)**2,label=r"$\sigma_{\text{ex}}$")
+plt.loglog(E_range,cross_sections_ion*(0.529)**2,label=r"$\sigma_{\text{ion}}$")
+#plt.loglog(Pandey_energies, Pandey_cross_secs, "x", label="M.K. Pandey, Y.K. Ho")
+plt.title("Cross section of interaction")
+plt.xlabel("Energy (keV)")
+plt.ylim(0.1,15)
+plt.ylabel("Cross section, "+r"$10^{-16}cm^2$")
+plt.legend()
+plt.show()
+
+'''
+10.031956044365698, 1.5518353500483775
+19.961625249677944, 1.4098152107696167
+29.873888570960162, 1.2898574960880107
+39.540414912083435, 1.1893581948708147
+49.82541628826433, 1.0972024797830786
+59.47915970142414, 1.0245887931961248
+70.65267539604942, 0.9603724452620136
+79.11710058773382, 0.9128910496076061
+89.46734230188392, 0.8710238063953555
+99.19872403421381, 0.8403370880466334
+199.4680687927284, 0.5610748115675428
+298.5335405391241, 0.4299126820120166
+395.1106236654619, 0.3406177956687405
+500.2933948930573, 0.26527467539448313
+'''
+
+fig, ax = plt.subplots(figsize=(5,4))
+plt.pcolormesh(v_range, b_range, all_ion_probs, cmap="hot", vmin=0,vmax=1 )
+plt.colorbar()
+plt.title("Ionisation probability")
+plt.xlabel("Velocity, a.u")
+#plt.xlabel("Antiproton energy, "+r"$MeV$")
+plt.ylabel("Impact parameter, " + r"$a_0$")
+plt.savefig("Ion prob against b and v.png")
+plt.show()  
