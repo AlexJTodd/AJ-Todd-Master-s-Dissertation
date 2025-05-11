@@ -1,7 +1,6 @@
 # 3D time independent Hydrogen atom
 
 #Sec 0: Importing packages
-
 import numpy as np
 import numba
 from numba import jit # "pip install numba "
