@@ -1,0 +1,231 @@
+import numpy as np
+import numba as nb
+from numba import jit
+import matplotlib.pyplot as plt
+from matplotlib import animation
+from matplotlib.animation import PillowWriter
+import timeit
+import timeit
+import scienceplots
+plt.style.use(['science','ieee'])
+
+
+# Declaring useful variables, arrays, matrices
+
+n_max = 600
+dx = 0.1
+total_length=dx*n_max
+
+n_vals = np.linspace(0,n_max-1,n_max)
+x_vals = dx*n_vals
+
+m_max = 50001
+dt = 0.001
+total_time = dt*m_max
+
+alpha = dt/(2*dx**2)
+
+print(alpha)
+
+
+psi_0 = 2*x_vals*np.exp(-x_vals) #Initial form of the wavefunction
+psi = np.zeros((m_max,n_max),dtype=complex)
+psi[0,:]=psi_0
+
+plt.plot(x_vals, psi_0, label="Probability amplitude")
+plt.plot(x_vals, np.abs(psi_0)**2, label="Probability density")
+plt.xlabel("Radial distance, "+r"$a_0$")
+plt.ylim(0,1)
+plt.legend()
+plt.show()
+
+
+normal_vals = np.zeros(m_max)
+normal_vals[0] = np.sum(np.absolute(psi[0,:])**2)*dx
+
+survival_prob = np.zeros(m_max)
+survival_prob[0] = np.sum(np.absolute(psi[0,:])**2)*dx
+
+
+## Antiproton values
+
+b = 5
+vel = 5
+m_ion = 10000
+print("Time of ionisation is "+str(m_ion*dt))
+#Runs a simulation
+
+
+@nb.jit("Tuple((c16[:,:],float64[:],float64[:]))(c16[:,:], float64[:], float64[:],float64,float64)",nopython=True,nogil=True)
+def compute_psi(psi,normal_vals,survival_prob,b,vel):
+    '''Takes a mostly empty wavefunction matrix psi, fills with data.'''
+    for m in range(0,m_max-1):
+        total_V = 0
+        #print("Timestep "+str(m))
+        for n in range(1,n_max-2):
+            #Generates the potential, and checks for infinities.
+            if n*dx == 0:
+                V_nuclear = -1/(1*dx)
+                
+            else:
+                V_nuclear = -1/(n*dx)
+                
+            if (b-n*dx)**2 + vel**2*dt**2*(m-m_ion)**2 == 0:
+                V_antiproton = 1/np.sqrt((b-(1+n)*dx)**2 + vel**2*dt**2*(m-m_ion+1)**2)
+                
+            else:
+                V_antiproton = 1/np.sqrt((b-n*dx)**2 + vel**2*dt**2*(m-m_ion)**2)
+                
+            total_V  =  V_nuclear #+ V_antiproton
+            
+            #Calculating next psi            
+            psi[m+1,n] = 1j/2 * dt/dx**2 * psi[m,n+1] + 1j/2 * dt/dx**2 * psi[m,n-1] - (1 - 1j * dt/dx**2) * psi[m,n] - 1j*dt*total_V*psi[m,n]
+            
+        #Normalising the wavefunction
+        normal = np.sum(np.absolute(psi[m+1,:])**2)*dx
+        normal_vals[m+1] = normal 
+
+        for n in range(1,n_max-2):
+            psi[m+1,n] = psi[m+1,n]/normal
+        survival_prob[m+1] = np.sum(np.absolute(psi[0,:]*psi[m+1,:]))*dx   
+               
+    return psi,normal_vals,survival_prob
+
+
+#%timeit compute_psi(psi.astype(complex))        
+psi, normal_vals,survival_prob = compute_psi(psi.astype(complex),normal_vals.astype(float),survival_prob.astype(float),b,vel)
+print("Finished")
+
+m0 = 2000
+
+plt.plot(x_vals,np.absolute(psi[0,:])**2, label = "k = 0")
+plt.plot(x_vals,np.absolute(psi[10000,:])**2, label = "k = 10000")
+plt.plot(x_vals,np.absolute(psi[20000,:])**2, label = "k = 20000")
+plt.plot(x_vals,np.absolute(psi[50000,:])**2, label = "k = 50000")
+
+#plt.plot(x_vals,np.real(psi[m0,:]),label="Real part")
+#plt.plot(x_vals,np.imag(psi[m0,:]),label="Imaginary part")
+#plt.plot(x_vals,np.absolute(psi[0,:])**2,label="Probability density at t = 0", linestyle = "dashed")
+#plt.title("Probability density at timestep "+str(m0))
+plt.ylim(0,1.1)
+plt.xlabel("Distance, a.u.")
+plt.ylabel("Probability density")
+plt.legend()
+plt.savefig("PD Antiproton b="+str(b)+", v="+str(vel)+".png")
+plt.show()
+
+plt.plot(normal_vals)
+#plt.title("Normal values")
+plt.ylim(0,1.2)
+plt.xlabel("Timestep "+r"$k$")
+plt.show()
+
+plt.plot(1-survival_prob)
+plt.title("Ionisation probability " + r"$\omega_{ion}$")
+plt.ylim(0,1.1)
+plt.show()
+'''
+def animate(m):
+    list1.set_data(x_vals,np.absolute(psi[1000*m,:])**2)
+    list2.set_data(x_vals,np.real(psi[1000*m,:]))
+    list3.set_data(x_vals,np.imag(psi[1000*m,:]))
+    list4.set_data(x_vals,np.absolute(psi[0,:])**2)
+    time_text.set_text("t={{{}}}".format(1000*m))
+ 
+fig, ax =plt.subplots(1,1, figsize=(8,4))
+list1, = plt.plot([],[], lw=2, markersize=8, label="Probability Density")
+list2, = plt.plot([],[], lw=2, markersize=8, label="Real part")
+list3, = plt.plot([],[], lw=2, markersize=8, label="Imaginary part")
+list4, = plt.plot([],[], lw=2, markersize=8, label="Original probability density", linestyle="dashed")
+time_text = ax.text(0.2,0.9, '', fontsize=15, bbox=dict(facecolor="white",edgecolor="black"))
+
+ax.set_ylim(-1.1,1.1)
+ax.set_ylabel("Radial Probability Density")
+ax.set_xlim(-0.1,n_max*dx+0.1)
+ax.set_xlabel("Radial Distance")
+ax.set_title("Wavefunction evolution with b="+str(b)+", v="+str(vel))
+ax.legend(loc="upper right")
+plt.tight_layout()
+              
+ani = animation.FuncAnimation(fig,animate,frames=int(m_max/1000),interval=0.5)
+ani.save(filename="P1s Wavefunction.gif",writer='pillow',fps=100,dpi=100)
+plt.show()
+'''
+
+'''
+#Section 2
+#Determining the cross section from many simulations:
+#Redefining variables   
+
+    
+vel_vals = np.linspace(0.01,0.2,10)    
+    
+b_vals = np.linspace(0,5,10)
+
+db = b_vals[1] - b_vals[0]
+    
+cross_sections =np.zeros(len(vel_vals))
+    
+init_psi_2 = 2*x_vals*np.exp(-x_vals)
+
+
+
+for index_1, vel_2 in enumerate(vel_vals):
+    #Resetting variables
+    total_psi_2 = np.zeros((m_max,n_max))
+    total_psi_2[0,:] = init_psi_2
+    
+    normal_vals_2 = np.zeros(m_max)
+    normal_vals_2[0] = np.sum(np.absolute(total_psi_2[0,:])**2)*dx
+
+    survival_prob_2 = np.zeros(m_max)
+    survival_prob_2[0] = np.sum(np.absolute(total_psi_2[0,:])**2)*dx
+    
+    endpt_ion_prob_2 = np.zeros(len(b_vals))
+    
+    
+    for index_2,b_2 in enumerate(b_vals):
+        total_psi_2, normal_vals_2,survival_prob_2 = compute_psi(total_psi_2.astype(complex),normal_vals_2.astype(float),survival_prob_2.astype(float),b_2,vel_2)
+        endpt_ion_prob_2[index_2] = 1-survival_prob_2[-1]
+        print("For b = "+str(b_2)+ " and v = "+str(vel_2)+", the final probability of ionisation is:" + str(endpt_ion_prob_2[index_2]))
+               
+    cross_sections[index_1] = 2*np.pi*np.sum(endpt_ion_prob_2*b_vals)*db
+    print("The cross section for v = "+str(vel_2)+" is: " + str(cross_sections[index_1]))
+    
+plt.plot(vel_vals,cross_sections)
+plt.xlabel("Velocity")
+plt.ylabel("Cross section")
+plt.title("Cross section of interaction against velocity of an antiproton.")    
+plt.show()
+    
+# Probability of ionisation curves
+    
+b_vals = np.linspace(0.01,4,50)
+vel_vals = np.linspace(0.1,10,10)
+endpt_ion_prob = np.zeros(50)
+
+vel1 = 0.001 #Indexing data for this section with 1.
+
+for index,each_b in enumerate(b_vals):   
+    print("Impact factor is b="+str(each_b))
+    psi1, normal_vals1,survival_prob1 = compute_psi(psi.astype(complex),normal_vals.astype(float),survival_prob.astype(float),each_b,vel1)
+    plt.plot( (1-survival_prob1) , label= ("b = "+str(each_b)))
+    endpt_ion_prob[index] = 1 - survival_prob1[-1]
+    print(endpt_ion_prob[index])
+
+plt.axvline(m_ion, linestyle = '--', color="black", label = "Impact point")
+plt.title("Probability of ionisation for velocity = " + str(vel1))
+plt.ylim(-0.1,1.1)
+plt.legend()
+plt.show()
+
+
+cross_section = 2*np.pi*np.sum(endpt_ion_prob*b_vals)*dx
+print(cross_section)
+plt.plot(b_vals, endpt_ion_prob)
+plt.xlabel("Impact parameter b, a.u.")
+plt.ylabel("Probability")
+plt.title("Probability of ionisation against b for a velocity v="+str(vel1))
+plt.show()
+    
+'''
