@@ -1,0 +1,412 @@
+import numpy as np
+from numpy import asarray
+from numpy import savetxt
+
+from scipy.linalg import eigh
+
+import matplotlib.pyplot as plt
+
+import numba
+from numba import jit
+
+#--- Functions
+
+def gen_gauss_wavefunction(coeffs, gaussians, pos_vals):
+    '''Generates a normalised wavefunction from a Gaussian basis'''
+    r_vals, dr = pos_vals[2], pos_vals[3]
+
+    wavefunction = 0
+    for index, coeff in enumerate(coeffs):
+        wavefunction += coeff*gaussians[:,index]
+        
+    norm = np.sqrt( np.sum( np.abs( wavefunction )**2 )*dr )
+
+    if max(abs(wavefunction)) != max(wavefunction): wavefunction = -wavefunction
+    
+    return wavefunction / norm, norm
+
+
+
+def normalise_wavefunction(wavefunction, dr):
+    '''Normalises the wavefunction'''
+    norm = np.sqrt(  np.sum( np.abs(wavefunction)**2 )*dr )
+    return wavefunction/norm, norm
+
+
+def gen_potential(t, pos_vals, ap_vals):
+    '''
+    Returns a 1D array of potential values. Existence of antiproton is 
+    specified by a boolean statement. If there is no antiproton, then set
+    ap_vals = [ , , , False ]
+    '''
+    eps = 1e-10
+    
+    nr, r_vals = pos_vals[1], pos_vals[2]
+    b, v, t_off, ap_status = ap_vals[0], ap_vals[1], ap_vals[2], ap_vals[3]
+    
+    V_nuc = -1 / ( r_vals - eps )
+    V_ap = 0
+    
+    if ap_status == True: V_ap = 1/np.sqrt( (b-r_vals)**2 + v**2*(t-t_off)**2 + eps )
+        
+    V_total = V_nuc + V_ap
+    
+    return V_total
+
+
+def gen_gaussian_basis(pos_vals, gauss_vals):
+    '''Returns a Gaussian basis, and their exponential coefficients'''
+    zeta_0, beta, ng = gauss_vals[0], gauss_vals[1], gauss_vals[2]
+    L, nr, r_vals = pos_vals[0], pos_vals[1], pos_vals[2]
+
+    gaussians = np.zeros( ( nr, ng ) )
+    zetas = np.zeros( ng )
+    
+    for i in range(ng):
+        zetas[i] = zeta_0*beta**i
+        gaussians[ :, i ] = r_vals*np.exp( - zetas[i]*r_vals**2) 
+    
+    return gaussians, zetas
+
+
+
+def GEM(pos_vals, gauss_vals):
+    ''' Generates the coefficients for an appropriate Gaussian basis, and returns the eigenenergies '''
+    zeta_0, beta, ng = gauss_vals[0], gauss_vals[1], gauss_vals[2]
+    L, nr, r_vals, dr = pos_vals[0], pos_vals[1], pos_vals[2], pos_vals[3]
+
+    gaussians, zetas = gen_gaussian_basis(pos_vals, gauss_vals)
+    
+    Q = np.zeros( ( ng, ng ) )
+    H = np.zeros( ( ng, ng ) )
+    eps = 1e-15
+
+    for i in range(ng):
+        for j in range(ng):
+            gaussian_i, gaussian_j = gaussians[ :, i ], gaussians[ :,j ]
+            gaussian_j_diff2 = np.gradient( np.gradient( gaussian_j, dr ), dr )
+            
+            zeta_i, zeta_j = zetas[i], zetas[j]
+            
+            Q[i , j] = 0.25*np.sqrt( np.pi / ( zeta_i + zeta_j)**3 ) #Analytical result
+            
+            potential = gen_potential(0, pos_vals, [1,1,1,False] )
+            V = np.sum(gaussian_i*potential*gaussian_j)*dr
+            
+            T = 0.75*zeta_i*zeta_j*np.sqrt( np.pi/(zeta_i+zeta_j)**5  ) #Analytical result
+            
+            H[i,j] = T + V
+            
+    eigvals, eigvecs = eigh( H, Q )
+  
+    return eigvals, eigvecs, gaussians
+
+
+def FDM(pos_vals):
+    ''' Runs a simulation using finite differences. Returns eigenvalues and normalised wavefunctions '''
+    nr, r_vals, dr = pos_vals[1], pos_vals[2], pos_vals[3]
+
+    eps = 1e-15
+    
+    alpha = -0.5/dr**2
+
+    D = alpha*np.diag( np.ones(nr-1), k=-1 ) - 2*alpha*np.diag( np.ones(nr) ) + alpha*np.diag( np.ones(nr-1), k=1 ) 
+
+    V = gen_potential(0, pos_vals, [1,1,1,False])
+    V_diag = np.diag(V)
+
+    H = D + V_diag
+
+    eigvals, wavefuncs = eigh(H)
+
+    for index in range(len(eigvals)):
+        wavefuncs[:,index] = normalise_wavefunction(wavefuncs[:,index],dr)[0]
+    
+    return eigvals, wavefuncs
+
+
+def return_surv_prob(init_state, end_state, dr):
+    '''Finds the "survival probability" of a system, given a new state, and the initial state.'''
+    surv_prob = np.abs( np.sum( init_state*end_state )*dr   )**2
+    return surv_prob
+
+
+def time_dep_FDM(psi, pos_vals, time_vals, ap_vals):
+    ''' Runs a finite difference simulation, given a time and an initial state '''
+    total_time, nt, t_vals, dt = time_vals[0], time_vals[1], time_vals[2], time_vals[3]
+    L, nr, r_vals, dr = pos_vals[0], pos_vals[1], pos_vals[2], pos_vals[3]
+
+    beta = (1j*dt)/(2*dr**2)
+    #print("Beta must be sufficiently small: "+str(beta))
+    
+    D = (1-2*beta)*np.diag( np.ones( nr ), k=0 ) + beta*np.diag( np.ones( nr-1 ), k=+1 ) +beta*np.diag( np.ones( nr-1 ), k=-1 )
+    total_data = np.zeros( ( nr, nt ), dtype = complex )
+    total_data[:,0] = psi
+
+    normal_vals = np.zeros( nt )
+    normal_vals[0] = 1 # Initial state is normalised
+
+    surv_probs = np.zeros( nt )
+    surv_probs[0] = 1 #Initial state is in the initial state... Of course.
+    
+    for t_index in range(0, nt-1):
+        t = t_vals[t_index]
+        #if t_index%10000 == 0: print(t_index, t)
+        
+        V = gen_potential(t, pos_vals, ap_vals)
+        V_diag = np.diag( V , k=0 ) 
+        P = D - 1j*dt*V_diag
+        total_data[:,t_index+1] = np.matmul( P, total_data[:, t_index], dtype=complex)
+        total_data[:,t_index+1], normal_vals[t_index+1] = normalise_wavefunction( total_data[:,t_index+1], dr )
+        total_data[0,t_index+1] = 0
+        surv_probs[t_index+1] = return_surv_prob(psi, total_data[:,t_index+1], dr)
+
+    print("The ionisation probability is "+str(1-np.round(surv_probs[-1],5)))
+    return total_data, normal_vals, surv_probs
+
+
+def gen_cross_sec(init_psi, pos_vals, time_vals, ap_vals):
+    '''Generates the cross section of interaction, and the final ionisation probability for any b or v. Saves the data in a text file.'''
+    b_range, v_range, t_off, ap_status = ap_vals[0], ap_vals[1], ap_vals[2], ap_vals[3]
+
+    print(ap_vals)
+    
+    no_b_vals = len(b_range)
+    no_v_vals = len(v_range)
+    db = b_range[1] - b_range[0]
+    
+    cross_sections = np.zeros( no_v_vals  )
+    all_end_ion_probs = np.zeros(( no_b_vals, no_v_vals ))
+
+    for index_v, v in enumerate( v_range ):
+        end_ion_probs = np.zeros( no_b_vals )
+        for index_b, b in enumerate( b_range ):
+            print(" ")
+            print("b="+str(np.round(b,3))+", v="+str(np.round(v,3)))
+            ap_vals = [b,v,t_off,ap_status]
+
+            total_data_FDM, normal_vals_FDM, surv_probs_FDM = time_dep_FDM( init_psi, pos_vals, time_vals, ap_vals )
+            end_ion_probs[index_b] = 1-surv_probs_FDM[-1]
+            all_end_ion_probs[ index_b, index_v ] = end_ion_probs[index_b]
+            
+        cross_sections[index_v] = 2*np.pi*np.sum( end_ion_probs*b_range )*db
+        print(" ")
+        print("Cross section for v = "+str(v)+" is "+str(np.round(cross_sections[index_v],5)))
+
+    #---Writes the data to a text file
+    np.savetxt("Final_ionisation_probs_1.txt", all_end_ion_probs, delimiter=" ")
+    np.savetxt("Cross_sections_1.txt", cross_sections, delimiter=" ")
+    print("Simulation finished. Data saved!")
+    
+    return cross_sections, all_end_ion_probs
+
+#--- Position values
+L = 60
+nr = 201
+r_vals = np.linspace(0,L,nr)
+dr = r_vals[1] - r_vals[0]
+
+pos_vals = [L, nr, r_vals, dr]
+
+#--- Time values
+T = 30
+nt = 60001
+t_vals = np.linspace(0,T,nt)
+dt = t_vals[1]-t_vals[0]
+
+time_vals = [T, nt, t_vals, dt]
+
+print(dr, dt)
+
+#--- Gaussian values
+
+zeta_0 = 0.001
+beta = 2
+ng = 20
+
+gauss_vals = [zeta_0, beta, ng]
+
+#--- For plotting
+
+max_n = 10 #Maximum number of states to be plotted.
+n_vals = np.linspace(1,max_n,max_n)
+
+which_state = 0 #---Which state we plot and evolve through time (for FDM)
+
+
+#--- Obtaining some values from GEM
+
+GEM_eigenenergies, GEM_coeffs, gaussian_basis = GEM(pos_vals, gauss_vals)
+
+psi_GEM, norm_GEM = gen_gauss_wavefunction(GEM_coeffs[:,which_state], gaussian_basis, pos_vals)
+
+#--- Obtaining some values from time-independent FDM
+
+FDM_eigenenergies, psi_FDM = FDM(pos_vals)
+
+print(FDM_eigenenergies)
+print(GEM_eigenenergies)
+
+#--- Time independent plots
+
+plt.title("L="+str(L)+", nr="+str(nr)+", ng="+str(ng)+", "+r"$\zeta_0= $"+str(zeta_0)+", "+r"$\beta= $"+str(beta)  )
+plt.plot(n_vals, -1/(2*n_vals**2)[0:max_n], "--", color="black",label="Analytic" ) 
+plt.plot(n_vals, GEM_eigenenergies[0:max_n], "s", color="red",label="GEM")
+plt.plot(n_vals, FDM_eigenenergies[0:max_n], "x", color="blue",label="FDM")
+plt.ylabel("Energy, "+r"$E_h$")
+plt.xlabel("Principle quantum number "+r"$n$")
+plt.legend()
+plt.show()
+
+radial_1s = 2*r_vals*np.exp(-r_vals)
+radial_2s = -( r_vals/np.sqrt(2) ) * (1-0.5*r_vals)*np.exp(-0.5*r_vals)
+radial_3s = r_vals*( 2/np.sqrt(27) )*(1-(2/3)*r_vals+(2/27)*r_vals**2)*np.exp(-r_vals/3)
+
+plt.title(r"$n=$"+str(which_state+1) )
+plt.plot(r_vals, np.abs(psi_GEM)**2, "--",color="red",label="GEM")
+plt.plot(r_vals, np.abs(psi_FDM[:,which_state])**2, "--", color="blue",label="FDM")
+if which_state == 0: plt.plot(r_vals, np.abs(radial_1s)**2, color="black",label="Analytic" ) #1s state
+if which_state == 1: plt.plot(r_vals, np.abs(radial_2s)**2, color="black", label="Analytic" ) #2s state
+if which_state == 2: plt.plot(r_vals, np.abs(radial_3s)**2, color="black", label="Analytic" ) #3s state
+
+plt.legend()
+plt.ylabel("Probability density")
+plt.xlabel("Radial distance, "+r"$a_0$")
+plt.show()
+
+#--- Time dependent simulations
+#ap_vals = b,v,t_off, status
+
+#--- Example antiproton values
+
+b = 5
+v = 5
+t_off = 10
+ap_status = True
+
+ap_vals = [b, v, t_off, ap_status]
+
+total_data_FDM, normal_vals_FDM, surv_probs_FDM = time_dep_FDM( psi_FDM[:,which_state], pos_vals, time_vals, ap_vals  )
+
+#--- Time dependent Plots
+
+which_timestep = 40000
+which_data = total_data_FDM[:,which_timestep]
+
+plt.title("Time = "+str(np.round(which_timestep*dt,3))+", timestep = "+str(which_timestep) )
+plt.plot(r_vals, np.real(which_data),"--", label="Real part" )
+plt.plot(r_vals, np.imag(which_data),"--", label="Imaginary part" )
+plt.plot(r_vals, np.abs(which_data)**2, color="black", label="PD" )
+if ap_status == True: plt.axvline(b, linestyle="dotted", color="red", label="Impact parameter")
+plt.xlabel("Distance, "+r"$a_0$")
+plt.ylim(-1,1)
+plt.legend()
+plt.show()
+
+plt.plot(t_vals, normal_vals_FDM)
+plt.ylim(-0.1,1.5)
+plt.title("Normal values")
+plt.xlabel("Time, a.u.")
+plt.ylabel("Norm, "+r"$\vert \vert P(r,t) \vert \vert$")
+plt.show()
+
+print(1-surv_probs_FDM[-1])
+plt.plot(t_vals, 1-surv_probs_FDM)
+if ap_status == True: plt.axvline(t_off, linestyle="dotted", color="black", label="Impact time")
+plt.title("Ionisation probability")
+
+if ap_status==True: plt.title("b="+str(b)+r"$a_0$ "+", v="+str(v)+r"$a.u.$"+ r"$, t_{\text{off}}=$"+str(t_off)+r"$a.u.$")
+plt.xlabel("Time, a.u.")
+plt.ylabel(r"$\omega_{\text{ion}}$")
+plt.ylim(-0.1,1.5)
+plt.legend()
+plt.show()
+
+#--- Cross section of interaction
+
+init_psi = psi_FDM[:,which_state]
+
+no_bv_vals = 10
+b_range = np.linspace(0.1,6.1,21)
+v_range = np.linspace(0.1,6.1,21)
+t_off = 10
+ap_status = True
+
+ap_vals = [ b_range, v_range, t_off, ap_status ]
+
+T = 30
+nt = 60000
+t_vals = np.linspace(0,T,nt)
+dt = t_vals[1]-t_vals[0]
+
+time_vals = [T, nt, t_vals, dt]
+
+
+cross_sections, all_end_ion_probs = gen_cross_sec(init_psi, pos_vals, time_vals, ap_vals)
+
+#---Reading the data from the text files
+
+data_FIP = np.loadtxt("Final_ionisation_probs_1.txt", delimiter=" ")
+data_CS = np.loadtxt("Cross_sections_1.txt", delimiter=" ")
+
+
+
+#print(data_CS)
+#print(data_FIP)
+
+#---Recasting these variables
+
+
+db = b_range[1] - b_range[0]
+dv = v_range[1] - v_range[0]
+#print(all_end_ion_probs)
+#print(cross_sections)
+
+plt.plot(v_range, data_CS)
+plt.title("Cross sections")
+plt.xlabel("Velocity, a.u.")
+plt.ylabel("Cross section, "+r"$a_0^2$")
+plt.savefig("Cross sections.png")
+plt.show()
+
+#Velocity against ionisation probability for a specific b
+
+which_b_index = 1
+
+which_b = b_range[which_b_index]
+
+plt.title("b = "+str(np.round(which_b,5)))
+plt.plot(v_range, data_FIP[which_b_index,:])
+plt.xlabel("Velocity")
+plt.ylabel("Ionisation probability")
+plt.ylim(0,1)
+plt.show()
+
+#Impact parameter against ionisation probability for a specific v
+
+which_v_index = 4
+
+which_v = v_range[which_v_index]
+which_eV = 27.2*0.4*1836*which_v**2/(10**6)
+
+plt.title("v = "+str(which_v)+" a.u. , T = "+str(np.round(which_eV,3))+"MeV")
+plt.plot(b_range, data_FIP[:,which_v_index])
+plt.xlabel("Impact parameter")
+plt.ylabel("Ionisation probability")
+plt.savefig("Ionprobagainstb, v = "+str(np.round(which_v,3))+".png")
+plt.ylim(0,1)
+plt.show()
+
+#--- A 2D plot of all data.
+
+E_range = 27.2*0.5*(1836)*v_range**2/(10**6) #Energy in Hartrees
+
+fig, ax = plt.subplots(figsize=(5,4))
+plt.pcolormesh(v_range, b_range, data_FIP, cmap="hot", vmin=0,vmax=1 )
+plt.colorbar()
+plt.title("Ionisation probabilities")
+plt.xlabel("Velocity, a.u")
+#plt.xlabel("Antiproton energy, "+r"$MeV$")
+plt.ylabel("Impact parameter, " + r"$a_0$")
+plt.savefig("Ion prob against b and v.png")
+plt.show() 
